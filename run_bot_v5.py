@@ -295,6 +295,39 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             response = json.dumps(trading_state, default=str)
             self.wfile.write(response.encode())
+        elif self.path == '/position':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            try:
+                import ccxt
+                KEY, SEC = get_api_keys()
+                ex = ccxt.huobi({'apiKey':KEY,'secret':SEC,'enableRateLimit':True,'options':{'defaultType':'swap'},'timeout':15000})
+                positions = ex.fetch_positions([SYMBOL])
+                bal = ex.fetch_balance()
+                result = {
+                    'usdt_total': bal.get('total', {}).get('USDT', 0),
+                    'usdt_free': bal.get('free', {}).get('USDT', 0),
+                    'usdt_used': bal.get('used', {}).get('USDT', 0),
+                    'positions': []
+                }
+                for p in positions:
+                    if float(p.get('contracts', 0) or 0) > 0:
+                        result['positions'].append({
+                            'symbol': p.get('symbol'),
+                            'side': p.get('side'),
+                            'contracts': float(p.get('contracts', 0)),
+                            'contract_size': p.get('contractSize'),
+                            'notional': float(p.get('notional', 0)) if p.get('notional') else None,
+                            'entry_price': float(p.get('entryPrice', 0)) if p.get('entryPrice') else None,
+                            'mark_price': float(p.get('markPrice', 0)) if p.get('markPrice') else None,
+                            'leverage': p.get('leverage'),
+                            'margin': float(p.get('initialMargin', 0)) if p.get('initialMargin') else None,
+                            'unrealized_pnl': float(p.get('unrealizedPnl', 0)) if p.get('unrealizedPnl') else None,
+                        })
+                self.wfile.write(json.dumps(result, default=str).encode())
+            except Exception as e:
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
