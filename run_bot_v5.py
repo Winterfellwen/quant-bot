@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
+from threading import Thread, Event
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%m-%d %H:%M:%S')
@@ -46,6 +46,9 @@ trading_state = {
     "drawdown_pct": 0.0,
     "leverage": 10,
 }
+
+# Manual control flags (thread-safe)
+resize_requested = Event()
 
 def get_api_keys():
     key = os.environ.get('HTX_API_KEY', '')
@@ -370,7 +373,33 @@ def trading_loop():
                 should_long = prob_up > 0.5
                 should_short = prob_up < 0.5
 
-                if should_long and cur_side == "short":
+                # Handle manual resize request
+                if resize_requested.is_set():
+                    logger.info(f"MANUAL RESIZE triggered (was {cur_side} x{cur_contracts})")
+                    if cur_side is not None and cur_contracts > 0:
+                        close_position(ex, cur_side, leverage, cur_contracts)
+                        time.sleep(2)
+                        cur_side, entry_price, cur_contracts = get_position(ex)
+                    if cur_side is None or cur_contracts == 0:
+                        new_size = calculate_dynamic_size(available_usdt, price, leverage)
+                        if new_size > 0:
+                            side = "long" if prob_up > 0.5 else "short"
+                            open_position(ex, side, leverage, new_size)
+                            logger.info(f"MANUAL RESIZE done: {side} x{new_size} prob={prob_up:.4f} bal={available_usdt:.2f}")
+                        else:
+                            logger.warning(f"MANUAL RESIZE failed: insufficient balance {available_usdt:.4f}")
+                    resize_requested.clear()
+                    continue  # Skip remaining logic this iteration
+
+                # Re-enter if no position (e.g. closed externally)
+                if cur_side is None:
+                    if order_size > 0:
+                        side = "long" if prob_up > 0.5 else "short"
+                        open_position(ex, side, leverage, order_size)
+                        logger.info(f"Re-entry (was None): {side} x{order_size} prob={prob_up:.4f} bal={available_usdt:.2f}")
+                    else:
+                        logger.warning(f"No position, insufficient balance {available_usdt:.4f}, waiting")
+                elif should_long and cur_side == "short":
                     realized = get_unrealized_pnl("short", entry_price, price, 10)
                     cumulative_return *= realized
                     peak_return = max(peak_return, cumulative_return)
@@ -456,6 +485,21 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass  # suppress logs
+
+    def do_POST(self):
+        if self.path == '/resize':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            if resize_requested.is_set():
+                response = json.dumps({'status': 'already_pending', 'message': 'Resize already requested, waiting for next loop iteration'})
+            else:
+                resize_requested.set()
+                response = json.dumps({'status': 'queued', 'message': 'Resize will execute on next loop iteration (within 180s). Bot will close current position and reopen with dynamic size based on current signal.'})
+            self.wfile.write(response.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 def start_http_server():
     port = int(os.environ.get('PORT', 8080))
