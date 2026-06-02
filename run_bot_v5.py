@@ -20,7 +20,12 @@ CANDLES_LIMIT = 2000
 INITIAL_TRAIN_BARS = 500
 RETRAIN_EVERY = 48
 LOOP_INTERVAL = 180
-ORDER_SIZE = 10
+ORDER_SIZE = 5  # Default fallback; overridden by dynamic sizing
+TARGET_CONTRACTS = 5  # 500 DOGE at 5x leverage (~ $9.4 margin)
+ABSOLUTE_MAX_CONTRACTS = 10
+MIN_USDT_TO_TRADE = 1.0
+CONTRACT_SIZE = 100  # Each contract = 100 DOGE
+LEVERAGE_SAFETY_FACTOR = 0.85  # Use 85% of available balance
 
 FEATURE_NAMES = [
     'r1','r3','r5','r12','r24','hl_pct','co_pct','pos20','pos50',
@@ -46,6 +51,87 @@ def get_api_keys():
     key = os.environ.get('HTX_API_KEY', '')
     secret = os.environ.get('HTX_API_SECRET', '')
     return key, secret
+
+def sign_huobi(method, host, path, params, secret):
+    """Sign Huobi API request using HMAC SHA256 (private endpoint auth)."""
+    import hmac, hashlib, base64
+    from urllib.parse import urlencode
+    sorted_params = sorted(params.items())
+    query_string = urlencode(sorted_params)
+    payload = f"{method}\n{host}\n{path}\n{query_string}"
+    digest = hmac.new(
+        secret.encode('utf-8'),
+        payload.encode('utf-8'),
+        hashlib.sha256
+    ).digest()
+    return base64.b64encode(digest).decode('utf-8')
+
+def get_unified_balance():
+    """
+    Query USDT balance from Huobi unified account via direct API.
+    Returns dict: {available, total, frozen, unrealized_pnl, margin_static, error?}
+    Works for both merged and unified accounts (err_code 4002 workaround).
+    """
+    try:
+        import requests
+        from datetime import datetime, timezone
+        from urllib.parse import urlencode
+        KEY, SEC = get_api_keys()
+        if not KEY or not SEC:
+            return {'available': 0, 'total': 0, 'frozen': 0, 'unrealized_pnl': 0, 'error': 'no_keys'}
+        host = "api.hbdm.com"
+        path = "/linear-swap-api/v3/unified_account_info"
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+        params = {
+            'AccessKeyId': KEY,
+            'SignatureMethod': 'HmacSHA256',
+            'SignatureVersion': '2',
+            'Timestamp': timestamp,
+        }
+        signature = sign_huobi('POST', host, path, params, SEC)
+        params['Signature'] = signature
+        url = f"https://{host}{path}?{urlencode(params)}"
+        r = requests.post(url, timeout=15)
+        data = r.json()
+        if data.get('status') == 'ok' or data.get('code') == 200:
+            for asset in data.get('data', []):
+                if asset.get('margin_asset') == 'USDT':
+                    return {
+                        'available': float(asset.get('withdraw_available', 0) or 0),
+                        'total': float(asset.get('margin_balance', 0) or 0),
+                        'frozen': float(asset.get('margin_frozen', 0) or 0),
+                        'unrealized_pnl': float(asset.get('cross_profit_unreal', 0) or 0),
+                        'margin_static': float(asset.get('margin_static', 0) or 0),
+                    }
+            return {'available': 0, 'total': 0, 'frozen': 0, 'unrealized_pnl': 0, 'error': 'no_usdt'}
+        else:
+            logger.warning(f"Unified account error: {data.get('err_msg') or data.get('msg')}")
+            return {'available': 0, 'total': 0, 'frozen': 0, 'unrealized_pnl': 0, 'error': data.get('err_msg') or data.get('msg')}
+    except Exception as e:
+        logger.error(f"Unified account fetch failed: {e}")
+        return {'available': 0, 'total': 0, 'frozen': 0, 'unrealized_pnl': 0, 'error': str(e)}
+
+def calculate_dynamic_size(available_usdt, price, leverage):
+    """
+    Calculate optimal order size in contracts based on available balance and target leverage.
+    Target: 5 contracts (500 DOGE) at 5x leverage (~$9.4 margin).
+    Caps scale up with available balance.
+    Returns: int (number of contracts) or 0 if insufficient balance.
+    """
+    if available_usdt is None or available_usdt < MIN_USDT_TO_TRADE:
+        return 0
+    notional_per_contract = CONTRACT_SIZE * price
+    margin_per_contract = notional_per_contract / max(leverage, 1)
+    usable = available_usdt * LEVERAGE_SAFETY_FACTOR
+    max_contracts = int(usable / margin_per_contract)
+    # Scale cap based on available funds
+    if available_usdt < 20:
+        cap = 5
+    elif available_usdt < 50:
+        cap = 7
+    else:
+        cap = ABSOLUTE_MAX_CONTRACTS
+    return max(1, min(max_contracts, cap))
 
 def compute_features(df, btc_ret1=0, btc_ret5=0, funding=0, oi_chg=0, oi_diverge=0, fg=50):
     c,h,l,v,o=df['close'],df['high'],df['low'],df['volume'],df['open']
@@ -129,6 +215,7 @@ def get_dynamic_leverage(drawdown_pct):
     return 10
 
 def get_position(ex):
+    """Return (side, entry_price, contracts) for current position."""
     try:
         pos=ex.fetch_positions([SYMBOL])
         for p in pos:
@@ -136,11 +223,11 @@ def get_position(ex):
             if contracts>0:
                 side=p.get('side','')
                 entry=float(p.get('entryPrice',0))
-                return side,entry
-        return None,0
+                return side,entry,abs(contracts)
+        return None,0,0
     except Exception as e:
         logger.warning(f"Position fetch: {e}")
-        return None,0
+        return None,0,0
 
 def get_unrealized_pnl(cur_side, entry_price, current_price, leverage):
     if cur_side is None or entry_price == 0: return 1.0
@@ -150,24 +237,32 @@ def get_unrealized_pnl(cur_side, entry_price, current_price, leverage):
         pnl_pct = (entry_price - current_price) / entry_price * leverage
     return 1.0 + pnl_pct
 
-def close_position(ex, side, leverage):
+def close_position(ex, side, leverage, contracts):
+    """Close position with the exact number of contracts held."""
     try:
+        if contracts <= 0:
+            logger.warning(f"close_position called with contracts={contracts}, skipping")
+            return
         if side=='long':
-            ex.create_order(SYMBOL,'market','sell',ORDER_SIZE,None,{'direction':'sell','offset':'close','lever_rate':leverage})
+            ex.create_order(SYMBOL,'market','sell',contracts,None,{'direction':'sell','offset':'close','lever_rate':leverage})
         else:
-            ex.create_order(SYMBOL,'market','buy',ORDER_SIZE,None,{'direction':'buy','offset':'close','lever_rate':leverage})
-        logger.info(f"Closed {side}")
+            ex.create_order(SYMBOL,'market','buy',contracts,None,{'direction':'buy','offset':'close','lever_rate':leverage})
+        logger.info(f"Closed {side} x{contracts}")
     except Exception as e:
         logger.error(f"Close failed: {e}")
 
-def open_position(ex, side, leverage):
+def open_position(ex, side, leverage, contracts):
+    """Open new position with dynamically calculated number of contracts."""
     try:
+        if contracts <= 0:
+            logger.warning(f"open_position called with contracts={contracts}, skipping (insufficient margin?)")
+            return
         ex.set_leverage(leverage, SYMBOL)
         if side=='long':
-            ex.create_order(SYMBOL,'market','buy',ORDER_SIZE,None,{'direction':'buy','offset':'open','lever_rate':leverage})
+            ex.create_order(SYMBOL,'market','buy',contracts,None,{'direction':'buy','offset':'open','lever_rate':leverage})
         else:
-            ex.create_order(SYMBOL,'market','sell',ORDER_SIZE,None,{'direction':'sell','offset':'open','lever_rate':leverage})
-        logger.info(f"Opened {side} @ {leverage}x")
+            ex.create_order(SYMBOL,'market','sell',contracts,None,{'direction':'sell','offset':'open','lever_rate':leverage})
+        logger.info(f"Opened {side} x{contracts} @ {leverage}x")
     except Exception as e:
         logger.error(f"Open failed: {e}")
 
@@ -199,8 +294,8 @@ def trading_loop():
     model.fit(Xt[:train_size][train_valid], yt[:train_size][train_valid])
     logger.info(f"Initial training: {train_valid.sum()} samples, {len(df)} candles")
 
-    cur_side, entry_price = get_position(ex)
-    logger.info(f"Current position: {cur_side or 'none'}, entry: {entry_price}")
+    cur_side, entry_price, cur_contracts = get_position(ex)
+    logger.info(f"Current position: {cur_side or 'none'}, entry: {entry_price}, contracts: {cur_contracts}")
 
     first_bar = True
     last_retrain_size = len(df)
@@ -232,7 +327,7 @@ def trading_loop():
                 logger.info(f"Retrained: {rt_valid.sum()} samples")
 
             prob_up = float(model.predict_proba(X[-1:])[0][1])
-            cur_side, entry_price = get_position(ex)
+            cur_side, entry_price, cur_contracts = get_position(ex)
             price = float(df['close'].iloc[-1])
 
             unrealized = get_unrealized_pnl(cur_side, entry_price, price, 10)
@@ -240,22 +335,36 @@ def trading_loop():
             dd_pct = (1 - estimated_equity / max(peak_return, cumulative_return)) * 100
             leverage = get_dynamic_leverage(max(dd_pct, 0))
 
+            # Get balance and calculate dynamic order size
+            balance = get_unified_balance()
+            available_usdt = balance.get('available', 0)
+            order_size = calculate_dynamic_size(available_usdt, price, leverage)
+
             # Update state for HTTP
             trading_state.update({
                 'last_check': datetime.now().isoformat(),
                 'current_position': cur_side,
+                'current_contracts': cur_contracts,
                 'last_prob': prob_up,
                 'cumulative_return': cumulative_return,
                 'equity': estimated_equity,
                 'drawdown_pct': dd_pct,
                 'leverage': leverage,
+                'available_usdt': available_usdt,
+                'total_usdt': balance.get('total', 0),
+                'unrealized_pnl': balance.get('unrealized_pnl', 0),
+                'next_order_size': order_size,
             })
 
             if first_bar and cur_side is None:
-                init_side = "long" if prob_up > 0.5 else "short"
-                open_position(ex, init_side, leverage)
-                logger.info(f"Initial entry: {init_side} prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} dd={dd_pct:.1f}%")
-                first_bar = False
+                if order_size <= 0:
+                    logger.warning(f"Insufficient balance ({available_usdt:.4f} USDT) to open initial position, will retry next loop")
+                    first_bar = False
+                else:
+                    init_side = "long" if prob_up > 0.5 else "short"
+                    open_position(ex, init_side, leverage, order_size)
+                    logger.info(f"Initial entry: {init_side} x{order_size} prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} dd={dd_pct:.1f}% bal={available_usdt:.2f}")
+                    first_bar = False
             else:
                 first_bar = False
                 should_long = prob_up > 0.5
@@ -265,20 +374,28 @@ def trading_loop():
                     realized = get_unrealized_pnl("short", entry_price, price, 10)
                     cumulative_return *= realized
                     peak_return = max(peak_return, cumulative_return)
-                    close_position(ex, "short", leverage)
+                    close_position(ex, "short", leverage, cur_contracts)
                     time.sleep(1)
-                    open_position(ex, "long", leverage)
-                    logger.info(f"Flip LONG: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}%")
+                    new_size = calculate_dynamic_size(available_usdt, price, leverage)
+                    if new_size > 0:
+                        open_position(ex, "long", leverage, new_size)
+                        logger.info(f"Flip LONG x{new_size}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f}")
+                    else:
+                        logger.warning(f"Skipped LONG open: insufficient balance {available_usdt:.4f}")
                 elif should_short and cur_side == "long":
                     realized = get_unrealized_pnl("long", entry_price, price, 10)
                     cumulative_return *= realized
                     peak_return = max(peak_return, cumulative_return)
-                    close_position(ex, "long", leverage)
+                    close_position(ex, "long", leverage, cur_contracts)
                     time.sleep(1)
-                    open_position(ex, "short", leverage)
-                    logger.info(f"Flip SHORT: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}%")
+                    new_size = calculate_dynamic_size(available_usdt, price, leverage)
+                    if new_size > 0:
+                        open_position(ex, "short", leverage, new_size)
+                        logger.info(f"Flip SHORT x{new_size}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f}")
+                    else:
+                        logger.warning(f"Skipped SHORT open: insufficient balance {available_usdt:.4f}")
                 else:
-                    logger.info(f"Holding {cur_side}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}%")
+                    logger.info(f"Holding {cur_side} x{cur_contracts}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f} next_size={order_size}")
 
         except Exception as e:
             logger.error(f"Loop error: {e}")
@@ -295,6 +412,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             response = json.dumps(trading_state, default=str)
             self.wfile.write(response.encode())
+        elif self.path == '/balance':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            try:
+                balance = get_unified_balance()
+                self.wfile.write(json.dumps(balance, default=str).encode())
+            except Exception as e:
+                self.wfile.write(json.dumps({'error': str(e), 'available': 0, 'total': 0}).encode())
         elif self.path == '/position':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -304,11 +430,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 KEY, SEC = get_api_keys()
                 ex = ccxt.huobi({'apiKey':KEY,'secret':SEC,'enableRateLimit':True,'options':{'defaultType':'swap'},'timeout':15000})
                 positions = ex.fetch_positions([SYMBOL])
-                bal = ex.fetch_balance()
                 result = {
-                    'usdt_total': bal.get('total', {}).get('USDT', 0),
-                    'usdt_free': bal.get('free', {}).get('USDT', 0),
-                    'usdt_used': bal.get('used', {}).get('USDT', 0),
                     'positions': []
                 }
                 for p in positions:
