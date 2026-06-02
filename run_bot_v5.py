@@ -254,6 +254,37 @@ def close_position(ex, side, leverage, contracts):
     except Exception as e:
         logger.error(f"Close failed: {e}")
 
+def add_to_position(ex, side, contracts, leverage):
+    """Add contracts to an existing position in the same direction (no close)."""
+    try:
+        if contracts <= 0:
+            return
+        ex.set_leverage(leverage, SYMBOL)
+        if side == 'long':
+            ex.create_order(SYMBOL, 'market', 'buy', contracts, None,
+                            {'direction': 'buy', 'offset': 'open', 'lever_rate': leverage})
+        else:
+            ex.create_order(SYMBOL, 'market', 'sell', contracts, None,
+                            {'direction': 'sell', 'offset': 'open', 'lever_rate': leverage})
+        logger.info(f"Added {contracts} to {side} position")
+    except Exception as e:
+        logger.error(f"Add failed: {e}")
+
+def reduce_position(ex, side, contracts, leverage):
+    """Partially close position without flipping direction."""
+    try:
+        if contracts <= 0:
+            return
+        if side == 'long':
+            ex.create_order(SYMBOL, 'market', 'sell', contracts, None,
+                            {'direction': 'sell', 'offset': 'close', 'lever_rate': leverage})
+        else:
+            ex.create_order(SYMBOL, 'market', 'buy', contracts, None,
+                            {'direction': 'buy', 'offset': 'close', 'lever_rate': leverage})
+        logger.info(f"Reduced {contracts} from {side} position")
+    except Exception as e:
+        logger.error(f"Reduce failed: {e}")
+
 def open_position(ex, side, leverage, contracts):
     """Open new position with dynamically calculated number of contracts."""
     try:
@@ -273,7 +304,20 @@ def trading_loop():
     import lightgbm as lgb
     logger.info("=== QuantBot v5 Trading Loop Started ===")
 
-    df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg, ex = fetch_all()
+    # Initial fetch with retry (Huobi ccxt may fail on Render)
+    ex = None
+    for attempt in range(6):
+        try:
+            df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg, ex = fetch_all()
+            logger.info(f"Init fetch OK: {len(df)} candles, price={df['close'].iloc[-1]:.5f}")
+            break
+        except Exception as e:
+            logger.error(f"Init fetch {attempt+1}/6 failed: {e}")
+            time.sleep(30)
+    else:
+        logger.error("Init fetch failed after 6 attempts")
+        trading_state['status'] = 'error'
+        return
     X = compute_features(df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg)
     c = df['close'].values
     y_binary = np.zeros(len(c))
@@ -423,8 +467,18 @@ def trading_loop():
                         logger.info(f"Flip SHORT x{new_size}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f}")
                     else:
                         logger.warning(f"Skipped SHORT open: insufficient balance {available_usdt:.4f}")
-                else:
-                    logger.info(f"Holding {cur_side} x{cur_contracts}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f} next_size={order_size}")
+                # Same direction - rebalance incrementally (add without close+reopen)
+                elif cur_side is not None:
+                    if cur_contracts < order_size:
+                        diff = order_size - cur_contracts
+                        add_to_position(ex, cur_side, diff, leverage)
+                        logger.info(f"REBALANCE +{diff}: {cur_side} {cur_contracts}→{order_size} prob={prob_up:.4f} bal={available_usdt:.2f}")
+                    elif cur_contracts > order_size:
+                        diff = cur_contracts - order_size
+                        reduce_position(ex, cur_side, diff, leverage)
+                        logger.info(f"REBALANCE -{diff}: {cur_side} {cur_contracts}→{order_size} prob={prob_up:.4f} bal={available_usdt:.2f}")
+                    else:
+                        logger.info(f"Holding {cur_side} x{cur_contracts}: prob={prob_up:.4f} F&G={fg} lev={leverage}x price={price:.4f} cum={cumulative_return:.3f}x dd={dd_pct:.1f}% bal={available_usdt:.2f} (size matches)")
 
         except Exception as e:
             logger.error(f"Loop error: {e}")
