@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: doge-quantbot-v5
+    env: python
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run_bot_v5.py
+    envVars:
+      - key: HTX_API_KEY
+        sync: false
+      - key: HTX_API_SECRET
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
