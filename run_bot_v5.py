@@ -398,6 +398,7 @@ def open_position(ex, side, leverage, contracts):
         logger.error(f"Open failed: {e}")
 
 def trading_loop():
+    logger.info("=== QuantBot v5 Trading Loop STARTING ===")  # Debug line
     import lightgbm as lgb
     logger.info("=== QuantBot v5 Trading Loop Started ===")
 
