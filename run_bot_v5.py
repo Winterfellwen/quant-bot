@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', date
 logger = logging.getLogger("quantbot_v5")
 
 SYMBOL = "DOGE/USDT:USDT"
-TIMEFRAME = "1h"
+TIMEFRAME = "60min"  # Huobi API uses '60min', not '1h'
 CANDLES_LIMIT = 2000
 INITIAL_TRAIN_BARS = 500
 RETRAIN_EVERY = 48
