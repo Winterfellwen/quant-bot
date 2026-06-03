@@ -47,6 +47,19 @@ trading_state = {
     "leverage": 10,
 }
 
+# Recent log buffer for /logs endpoint
+recent_logs = []
+class LogCollector(logging.Handler):
+    def emit(self, record):
+        msg = self.format(record)
+        recent_logs.append(msg)
+        if len(recent_logs) > 100:
+            recent_logs.pop(0)
+
+_log_collector = LogCollector()
+_log_collector.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%m-%d %H:%M:%S'))
+logging.getLogger().addHandler(_log_collector)
+
 # Manual control flags (thread-safe)
 resize_requested = Event()
 
@@ -128,21 +141,18 @@ def fetch_open_interest_http(symbol_code='DOGE-USDT'):
     return ticks
 
 def fetch_position_http():
-    """Fetch current position via signed HTTP (no ccxt)."""
-    try:
-        data = huobi_signed_post('/linear-swap-api/v1/swap_position_info', {'contract_code': 'DOGE-USDT'})
-        if data.get('status') == 'ok' and data.get('data'):
-            for p in data['data']:
-                contracts = float(p.get('volume', 0) or 0)
-                if contracts > 0:
-                    direction = p.get('direction', '')
-                    side = 'long' if direction == 'buy' else 'short'
-                    entry = float(p.get('cost_hold', 0)) if float(p.get('cost_hold', 0)) > 0 else float(p.get('cost_open', 0))
-                    return side, entry, contracts
-        return None, 0, 0
-    except Exception as e:
-        logger.error(f"fetch_position_http: {e}")
-        return None, 0, 0
+    """Fetch current position via signed HTTP (no ccxt). Raises on API error."""
+    data = huobi_signed_post('/linear-swap-api/v1/swap_position_info', {'contract_code': 'DOGE-USDT'})
+    if data.get('status') != 'ok':
+        raise Exception(f"Position API error: {data.get('err_msg', data)}")
+    for p in (data.get('data') or []):
+        contracts = float(p.get('volume', 0) or 0)
+        if contracts > 0:
+            direction = p.get('direction', '')
+            side = 'long' if direction == 'buy' else 'short'
+            entry = float(p.get('cost_hold', 0)) if float(p.get('cost_hold', 0)) > 0 else float(p.get('cost_open', 0))
+            return side, entry, contracts
+    return None, 0, 0
 
 def set_leverage_http(leverage):
     """Set leverage via signed HTTP."""
@@ -335,17 +345,27 @@ def close_position(ex, side, leverage, contracts):
     direction = 'sell' if side == 'long' else 'buy'
     create_order_http(direction, 'close', contracts, leverage)
     logger.info(f"Close order sent: {side} x{contracts}")
-    # Wait and verify position is actually closed
-    for _ in range(5):
+    # Wait and verify position is actually closed (handle transient errors)
+    for attempt in range(5):
         time.sleep(2)
+        try:
+            _, _, remaining = fetch_position_http()
+            if remaining <= 0:
+                logger.info(f"Position confirmed closed (attempt {attempt+1}, remaining={remaining})")
+                return
+        except Exception as e:
+            logger.warning(f"Close verify attempt {attempt+1} failed (transient): {e}")
+            continue  # Retry on transient error
+    # Final check - raise if still open
+    try:
         _, _, remaining = fetch_position_http()
-        if remaining <= 0:
-            logger.info(f"Position confirmed closed (remaining={remaining})")
-            return
-    # If position still exists, check remaining
-    _, _, remaining = fetch_position_http()
-    if remaining > 0:
-        raise Exception(f"Position NOT closed after order! Remaining: {remaining} contracts")
+        if remaining > 0:
+            raise Exception(f"Position NOT closed after order! Remaining: {remaining} contracts")
+        logger.info(f"Position confirmed closed (final check, remaining={remaining})")
+    except Exception as e:
+        if "NOT closed" in str(e):
+            raise
+        raise Exception(f"Cannot verify close status: {e}. Assuming position still open.")
 
 def add_to_position(ex, side, contracts, leverage):
     """Add contracts via direct HTTP."""
@@ -522,9 +542,9 @@ def trading_loop():
                         logger.warning(f"No position, insufficient balance {available_usdt:.4f}, waiting")
                 elif should_long and cur_side == "short":
                     realized = get_unrealized_pnl("short", entry_price, price, 10)
-                    cumulative_return *= realized
+                    close_position(ex, "short", leverage, cur_contracts)  # Raises on failure
+                    cumulative_return *= realized  # Only update AFTER close verified
                     peak_return = max(peak_return, cumulative_return)
-                    close_position(ex, "short", leverage, cur_contracts)
                     time.sleep(1)
                     new_size = calculate_dynamic_size(available_usdt, price, leverage)
                     if new_size > 0:
@@ -534,9 +554,9 @@ def trading_loop():
                         logger.warning(f"Skipped LONG open: insufficient balance {available_usdt:.4f}")
                 elif should_short and cur_side == "long":
                     realized = get_unrealized_pnl("long", entry_price, price, 10)
-                    cumulative_return *= realized
+                    close_position(ex, "long", leverage, cur_contracts)  # Raises on failure
+                    cumulative_return *= realized  # Only update AFTER close verified
                     peak_return = max(peak_return, cumulative_return)
-                    close_position(ex, "long", leverage, cur_contracts)
                     time.sleep(1)
                     new_size = calculate_dynamic_size(available_usdt, price, leverage)
                     if new_size > 0:
@@ -598,6 +618,32 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(result, default=str).encode())
             except Exception as e:
                 self.wfile.write(json.dumps({'error': str(e)}).encode())
+        elif self.path == '/diag':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            import requests
+            results = {}
+            # Test api.hbdm.com connectivity
+            try:
+                t0 = time.time()
+                r = requests.get("https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=DOGE-USDT", timeout=10)
+                results['api_hbdm_com'] = {'status': r.status_code, 'ms': int((time.time()-t0)*1000), 'ok': r.status_code == 200}
+            except Exception as e:
+                results['api_hbdm_com'] = {'error': str(e), 'ok': False}
+            # Test api.hbdm.vn connectivity
+            try:
+                t0 = time.time()
+                r = requests.get("https://api.hbdm.vn/linear-swap-ex/market/detail/merged?contract_code=DOGE-USDT", timeout=10)
+                results['api_hbdm_vn'] = {'status': r.status_code, 'ms': int((time.time()-t0)*1000), 'ok': r.status_code == 200}
+            except Exception as e:
+                results['api_hbdm_vn'] = {'error': str(e), 'ok': False}
+            self.wfile.write(json.dumps(results, default=str).encode())
+        elif self.path == '/logs':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'recent': recent_logs}, default=str).encode())
         else:
             self.send_response(404)
             self.end_headers()
