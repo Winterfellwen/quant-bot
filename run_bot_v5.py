@@ -155,22 +155,20 @@ def set_leverage_http(leverage):
         logger.error(f"set_leverage_http: {e}")
 
 def create_order_http(direction, offset, contracts, leverage):
-    """Create order via signed HTTP (market order)."""
-    try:
-        set_leverage_http(leverage)
-        body = {
-            'contract_code': 'DOGE-USDT',
-            'direction': direction,
-            'offset': offset,
-            'volume': contracts,
-            'order_price_type': 'market',
-            'lever_rate': leverage,
-        }
-        data = huobi_signed_post('/linear-swap-api/v1/swap_order', body)
-        if data.get('status') != 'ok':
-            logger.error(f"create_order_http: {data.get('err_msg', data)}")
-    except Exception as e:
-        logger.error(f"create_order_http: {e}")
+    """Create order via signed HTTP (market order). Raises on failure."""
+    set_leverage_http(leverage)
+    body = {
+        'contract_code': 'DOGE-USDT',
+        'direction': direction,
+        'offset': offset,
+        'volume': contracts,
+        'order_price_type': 'market',
+        'lever_rate': leverage,
+    }
+    data = huobi_signed_post('/linear-swap-api/v1/swap_order', body)
+    if data.get('status') != 'ok':
+        raise Exception(f"Huobi order failed: {data.get('err_msg', data)}")
+    logger.info(f"Order OK: {direction} {offset} x{contracts} @ {leverage}x")
 
 def get_unified_balance():
     """
@@ -332,14 +330,22 @@ def get_unrealized_pnl(cur_side, entry_price, current_price, leverage):
     return 1.0 + pnl_pct
 
 def close_position(ex, side, leverage, contracts):
-    """Close position with direct HTTP."""
-    try:
-        if contracts <= 0: return
-        direction = 'sell' if side == 'long' else 'buy'
-        create_order_http(direction, 'close', contracts, leverage)
-        logger.info(f"Closed {side} x{contracts}")
-    except Exception as e:
-        logger.error(f"Close failed: {e}")
+    """Close position via direct HTTP, then verify it's actually closed."""
+    if contracts <= 0: return
+    direction = 'sell' if side == 'long' else 'buy'
+    create_order_http(direction, 'close', contracts, leverage)
+    logger.info(f"Close order sent: {side} x{contracts}")
+    # Wait and verify position is actually closed
+    for _ in range(5):
+        time.sleep(2)
+        _, _, remaining = fetch_position_http()
+        if remaining <= 0:
+            logger.info(f"Position confirmed closed (remaining={remaining})")
+            return
+    # If position still exists, check remaining
+    _, _, remaining = fetch_position_http()
+    if remaining > 0:
+        raise Exception(f"Position NOT closed after order! Remaining: {remaining} contracts")
 
 def add_to_position(ex, side, contracts, leverage):
     """Add contracts via direct HTTP."""
