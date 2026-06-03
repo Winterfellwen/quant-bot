@@ -668,12 +668,12 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 def keep_alive():
-    """Self-ping every 10 minutes to prevent Render free plan from sleeping."""
+    """Self-ping every 50 seconds to prevent Render free plan from sleeping."""
     import requests
     port = int(os.environ.get('PORT', 8080))
     url = f"http://127.0.0.1:{port}/health"
     while True:
-        time.sleep(600)  # 10 minutes
+        time.sleep(50)  # 50 seconds
         try:
             r = requests.get(url, timeout=10)
             logger.info(f"[KeepAlive] Self-ping OK ({r.status_code})")
