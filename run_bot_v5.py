@@ -151,7 +151,7 @@ def fetch_position_http():
             direction = p.get('direction', '')
             side = 'long' if direction == 'buy' else 'short'
             entry = float(p.get('cost_hold', 0)) if float(p.get('cost_hold', 0)) > 0 else float(p.get('cost_open', 0))
-            return side, entry, contracts
+            return side, entry, int(contracts)  # Return as int for volume field
     return None, 0, 0
 
 def set_leverage_http(leverage):
