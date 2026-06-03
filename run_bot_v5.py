@@ -69,6 +69,109 @@ def sign_huobi(method, host, path, params, secret):
     ).digest()
     return base64.b64encode(digest).decode('utf-8')
 
+def huobi_signed_post(path, body, timeout=15):
+    """Make a signed POST request to Huobi API (api.hbdm.com)."""
+    import requests
+    from datetime import datetime, timezone
+    from urllib.parse import urlencode
+    KEY, SEC = get_api_keys()
+    host = "api.hbdm.com"
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    params = {
+        'AccessKeyId': KEY,
+        'SignatureMethod': 'HmacSHA256',
+        'SignatureVersion': '2',
+        'Timestamp': timestamp,
+    }
+    signature = sign_huobi('POST', host, path, params, SEC)
+    params['Signature'] = signature
+    url = f"https://{host}{path}?{urlencode(params)}"
+    r = requests.post(url, json=body, timeout=timeout)
+    return r.json()
+
+def fetch_ohlcv_http(symbol_code='DOGE-USDT', period=TIMEFRAME, limit=CANDLES_LIMIT):
+    """Fetch OHLCV kline directly from Huobi (public, no auth)."""
+    import requests
+    url = f"https://api.hbdm.com/linear-swap-ex/market/history/kline?contract_code={symbol_code}&period={period}&size={limit}"
+    r = requests.get(url, timeout=30)
+    data = r.json()
+    if data.get('status') == 'ok' and data.get('data'):
+        candles = []
+        for d in data['data']:
+            candles.append([int(d['id']), float(d['open']), float(d['high']),
+                           float(d['low']), float(d['close']), float(d['vol'])])
+        candles.sort(key=lambda x: x[0])
+        return candles
+    return []
+
+def fetch_funding_rate_http(symbol_code='DOGE-USDT'):
+    """Fetch funding rate directly from Huobi."""
+    import requests
+    url = f"https://api.hbdm.com/linear-swap-api/v1/swap_funding_rate?contract_code={symbol_code}"
+    r = requests.get(url, timeout=15)
+    data = r.json()
+    if data.get('status') == 'ok' and data.get('data'):
+        return float(data['data'].get('funding_rate', 0))
+    return 0
+
+def fetch_open_interest_http(symbol_code='DOGE-USDT'):
+    """Fetch open interest history directly."""
+    import requests
+    body = {'contract_code': symbol_code, 'period': '60min', 'amount_type': 1, 'size': 5}
+    r = requests.post("https://api.hbdm.com/linear-swap-api/v1/swap_his_open_interest", json=body, timeout=15)
+    data = r.json()
+    ticks = []
+    if data.get('status') == 'ok' and data.get('data'):
+        d = data['data']
+        if 'tick' in d: ticks = d['tick']
+        elif isinstance(d, list) and len(d) > 0 and 'tick' in d[0]: ticks = d[0]['tick']
+    return ticks
+
+def fetch_position_http():
+    """Fetch current position via signed HTTP (no ccxt)."""
+    try:
+        data = huobi_signed_post('/linear-swap-api/v1/swap_position_info', {'contract_code': 'DOGE-USDT'})
+        if data.get('status') == 'ok' and data.get('data'):
+            for p in data['data']:
+                contracts = float(p.get('volume', 0) or 0)
+                if contracts > 0:
+                    direction = p.get('direction', '')
+                    side = 'long' if direction == 'buy' else 'short'
+                    entry = float(p.get('cost_hold', 0)) if float(p.get('cost_hold', 0)) > 0 else float(p.get('cost_open', 0))
+                    return side, entry, contracts
+        return None, 0, 0
+    except Exception as e:
+        logger.error(f"fetch_position_http: {e}")
+        return None, 0, 0
+
+def set_leverage_http(leverage):
+    """Set leverage via signed HTTP."""
+    try:
+        data = huobi_signed_post('/linear-swap-api/v1/swap_switch_lever_rate',
+                                 {'contract_code': 'DOGE-USDT', 'lever_rate': leverage})
+        if data.get('status') != 'ok':
+            logger.warning(f"set_leverage_http: {data.get('err_msg', data)}")
+    except Exception as e:
+        logger.error(f"set_leverage_http: {e}")
+
+def create_order_http(direction, offset, contracts, leverage):
+    """Create order via signed HTTP (market order)."""
+    try:
+        set_leverage_http(leverage)
+        body = {
+            'contract_code': 'DOGE-USDT',
+            'direction': direction,
+            'offset': offset,
+            'volume': contracts,
+            'order_price_type': 'market',
+            'lever_rate': leverage,
+        }
+        data = huobi_signed_post('/linear-swap-api/v1/swap_order', body)
+        if data.get('status') != 'ok':
+            logger.error(f"create_order_http: {data.get('err_msg', data)}")
+    except Exception as e:
+        logger.error(f"create_order_http: {e}")
+
 def get_unified_balance():
     """
     Query USDT balance from Huobi unified account via direct API.
@@ -175,28 +278,27 @@ def compute_features(df, btc_ret1=0, btc_ret5=0, funding=0, oi_chg=0, oi_diverge
     return np.nan_to_num(np.column_stack(arrs),nan=0.0)
 
 def fetch_all():
-    import ccxt, requests
-    KEY,SEC = get_api_keys()
-    ex = ccxt.huobi({'apiKey':KEY,'secret':SEC,'enableRateLimit':True,'options':{'defaultType':'swap'},'timeout':30000})
-    doge = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=CANDLES_LIMIT)
-    df = pd.DataFrame(doge,columns=['ts','open','high','low','close','volume'])
-    df['ts']=pd.to_datetime(df['ts'],unit='ms'); df.set_index('ts',inplace=True)
+    """Fetch all market data via direct HTTP (no ccxt)."""
+    import requests
+    candles = fetch_ohlcv_http('DOGE-USDT', TIMEFRAME, CANDLES_LIMIT)
+    if not candles:
+        raise Exception("fetch_ohlcv_http returned empty candles")
+    df = pd.DataFrame(candles, columns=['ts','open','high','low','close','volume'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='s'); df.set_index('ts', inplace=True)
     btc_r1=0; btc_r5=0
     try:
-        btc=ex.fetch_ohlcv('BTC/USDT:USDT',TIMEFRAME,limit=6)
-        bc=[b[4] for b in btc]
+        btc = fetch_ohlcv_http('BTC-USDT', TIMEFRAME, 6)
+        bc = [b[4] for b in btc]
         if len(bc)>1: btc_r1=(bc[-1]-bc[-2])/bc[-2]
         if len(bc)>5: btc_r5=(bc[-1]-bc[-6])/bc[-6]
     except: pass
-    funding=0
+    funding = 0
     try:
-        fr=ex.fetch_funding_rate(SYMBOL)
-        funding=float(fr.get('fundingRate',0))
+        funding = fetch_funding_rate_http('DOGE-USDT')
     except: pass
     oi_chg=0; oi_diverge=0
     try:
-        r=ex.contractPublicGetLinearSwapApiV1SwapHisOpenInterest({'contract_code':'DOGE-USDT','period':'60min','amount_type':1,'size':5})
-        ticks=r.get('data',{}).get('tick',[])
+        ticks = fetch_open_interest_http('DOGE-USDT')
         if ticks:
             ov=[float(t['value']) for t in ticks[-5:]]
             if len(ov)>4: oi_chg=(ov[-1]-ov[0])/ov[0]
@@ -210,27 +312,16 @@ def fetch_all():
         r=requests.get('https://api.alternative.me/fng/?limit=1',headers={'User-Agent':'Mozilla/5.0'},timeout=10)
         fg=int(r.json()['data'][0]['value'])
     except: pass
-    return df,btc_r1,btc_r5,funding,oi_chg,oi_diverge,fg,ex
+    return df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg
 
 def get_dynamic_leverage(drawdown_pct):
     if drawdown_pct > 40: return 3
     elif drawdown_pct > 20: return 5
     return 10
 
-def get_position(ex):
-    """Return (side, entry_price, contracts) for current position."""
-    try:
-        pos=ex.fetch_positions([SYMBOL])
-        for p in pos:
-            contracts=float(p.get('contracts',0) or 0)
-            if contracts>0:
-                side=p.get('side','')
-                entry=float(p.get('entryPrice',0))
-                return side,entry,abs(contracts)
-        return None,0,0
-    except Exception as e:
-        logger.warning(f"Position fetch: {e}")
-        return None,0,0
+def get_position(ex=None):
+    """Return (side, entry_price, contracts) using direct HTTP (ex arg ignored)."""
+    return fetch_position_http()
 
 def get_unrealized_pnl(cur_side, entry_price, current_price, leverage):
     if cur_side is None or entry_price == 0: return 1.0
@@ -241,61 +332,41 @@ def get_unrealized_pnl(cur_side, entry_price, current_price, leverage):
     return 1.0 + pnl_pct
 
 def close_position(ex, side, leverage, contracts):
-    """Close position with the exact number of contracts held."""
+    """Close position with direct HTTP."""
     try:
-        if contracts <= 0:
-            logger.warning(f"close_position called with contracts={contracts}, skipping")
-            return
-        if side=='long':
-            ex.create_order(SYMBOL,'market','sell',contracts,None,{'direction':'sell','offset':'close','lever_rate':leverage})
-        else:
-            ex.create_order(SYMBOL,'market','buy',contracts,None,{'direction':'buy','offset':'close','lever_rate':leverage})
+        if contracts <= 0: return
+        direction = 'sell' if side == 'long' else 'buy'
+        create_order_http(direction, 'close', contracts, leverage)
         logger.info(f"Closed {side} x{contracts}")
     except Exception as e:
         logger.error(f"Close failed: {e}")
 
 def add_to_position(ex, side, contracts, leverage):
-    """Add contracts to an existing position in the same direction (no close)."""
+    """Add contracts via direct HTTP."""
     try:
-        if contracts <= 0:
-            return
-        ex.set_leverage(leverage, SYMBOL)
-        if side == 'long':
-            ex.create_order(SYMBOL, 'market', 'buy', contracts, None,
-                            {'direction': 'buy', 'offset': 'open', 'lever_rate': leverage})
-        else:
-            ex.create_order(SYMBOL, 'market', 'sell', contracts, None,
-                            {'direction': 'sell', 'offset': 'open', 'lever_rate': leverage})
+        if contracts <= 0: return
+        direction = 'buy' if side == 'long' else 'sell'
+        create_order_http(direction, 'open', contracts, leverage)
         logger.info(f"Added {contracts} to {side} position")
     except Exception as e:
         logger.error(f"Add failed: {e}")
 
 def reduce_position(ex, side, contracts, leverage):
-    """Partially close position without flipping direction."""
+    """Reduce contracts via direct HTTP."""
     try:
-        if contracts <= 0:
-            return
-        if side == 'long':
-            ex.create_order(SYMBOL, 'market', 'sell', contracts, None,
-                            {'direction': 'sell', 'offset': 'close', 'lever_rate': leverage})
-        else:
-            ex.create_order(SYMBOL, 'market', 'buy', contracts, None,
-                            {'direction': 'buy', 'offset': 'close', 'lever_rate': leverage})
+        if contracts <= 0: return
+        direction = 'sell' if side == 'long' else 'buy'
+        create_order_http(direction, 'close', contracts, leverage)
         logger.info(f"Reduced {contracts} from {side} position")
     except Exception as e:
         logger.error(f"Reduce failed: {e}")
 
 def open_position(ex, side, leverage, contracts):
-    """Open new position with dynamically calculated number of contracts."""
+    """Open new position with direct HTTP."""
     try:
-        if contracts <= 0:
-            logger.warning(f"open_position called with contracts={contracts}, skipping (insufficient margin?)")
-            return
-        ex.set_leverage(leverage, SYMBOL)
-        if side=='long':
-            ex.create_order(SYMBOL,'market','buy',contracts,None,{'direction':'buy','offset':'open','lever_rate':leverage})
-        else:
-            ex.create_order(SYMBOL,'market','sell',contracts,None,{'direction':'sell','offset':'open','lever_rate':leverage})
+        if contracts <= 0: return
+        direction = 'buy' if side == 'long' else 'sell'
+        create_order_http(direction, 'open', contracts, leverage)
         logger.info(f"Opened {side} x{contracts} @ {leverage}x")
     except Exception as e:
         logger.error(f"Open failed: {e}")
@@ -308,7 +379,7 @@ def trading_loop():
     ex = None
     for attempt in range(6):
         try:
-            df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg, ex = fetch_all()
+            df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg = fetch_all()
             logger.info(f"Init fetch OK: {len(df)} candles, price={df['close'].iloc[-1]:.5f}")
             break
         except Exception as e:
@@ -341,7 +412,7 @@ def trading_loop():
     model.fit(Xt[:train_size][train_valid], yt[:train_size][train_valid])
     logger.info(f"Initial training: {train_valid.sum()} samples, {len(df)} candles")
 
-    cur_side, entry_price, cur_contracts = get_position(ex)
+    cur_side, entry_price, cur_contracts = get_position(None)
     logger.info(f"Current position: {cur_side or 'none'}, entry: {entry_price}, contracts: {cur_contracts}")
 
     first_bar = True
@@ -352,7 +423,7 @@ def trading_loop():
 
     while True:
         try:
-            df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg, ex = fetch_all()
+            df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg = fetch_all()
             X = compute_features(df, btc_r1, btc_r5, funding, oi_chg, oi_diverge, fg)
 
             if len(df) - last_retrain_size >= RETRAIN_EVERY:
@@ -374,7 +445,7 @@ def trading_loop():
                 logger.info(f"Retrained: {rt_valid.sum()} samples")
 
             prob_up = float(model.predict_proba(X[-1:])[0][1])
-            cur_side, entry_price, cur_contracts = get_position(ex)
+            cur_side, entry_price, cur_contracts = get_position(None)
             price = float(df['close'].iloc[-1])
 
             unrealized = get_unrealized_pnl(cur_side, entry_price, price, 10)
@@ -423,7 +494,7 @@ def trading_loop():
                     if cur_side is not None and cur_contracts > 0:
                         close_position(ex, cur_side, leverage, cur_contracts)
                         time.sleep(2)
-                        cur_side, entry_price, cur_contracts = get_position(ex)
+                        cur_side, entry_price, cur_contracts = get_position(None)
                     if cur_side is None or cur_contracts == 0:
                         new_size = calculate_dynamic_size(available_usdt, price, leverage)
                         if new_size > 0:
@@ -509,27 +580,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             try:
-                import ccxt
-                KEY, SEC = get_api_keys()
-                ex = ccxt.huobi({'apiKey':KEY,'secret':SEC,'enableRateLimit':True,'options':{'defaultType':'swap'},'timeout':15000})
-                positions = ex.fetch_positions([SYMBOL])
-                result = {
-                    'positions': []
-                }
-                for p in positions:
-                    if float(p.get('contracts', 0) or 0) > 0:
-                        result['positions'].append({
-                            'symbol': p.get('symbol'),
-                            'side': p.get('side'),
-                            'contracts': float(p.get('contracts', 0)),
-                            'contract_size': p.get('contractSize'),
-                            'notional': float(p.get('notional', 0)) if p.get('notional') else None,
-                            'entry_price': float(p.get('entryPrice', 0)) if p.get('entryPrice') else None,
-                            'mark_price': float(p.get('markPrice', 0)) if p.get('markPrice') else None,
-                            'leverage': p.get('leverage'),
-                            'margin': float(p.get('initialMargin', 0)) if p.get('initialMargin') else None,
-                            'unrealized_pnl': float(p.get('unrealizedPnl', 0)) if p.get('unrealizedPnl') else None,
-                        })
+                side, entry, contracts = fetch_position_http()
+                result = {'positions': []}
+                if side is not None and contracts > 0:
+                    result['positions'].append({
+                        'symbol': 'DOGE/USDT:USDT',
+                        'side': side,
+                        'contracts': contracts,
+                        'entry_price': entry,
+                    })
                 self.wfile.write(json.dumps(result, default=str).encode())
             except Exception as e:
                 self.wfile.write(json.dumps({'error': str(e)}).encode())
