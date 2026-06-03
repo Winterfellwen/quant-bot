@@ -666,6 +666,19 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+def keep_alive():
+    """Self-ping every 10 minutes to prevent Render free plan from sleeping."""
+    import requests
+    port = int(os.environ.get('PORT', 8080))
+    url = f"http://127.0.0.1:{port}/health"
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            r = requests.get(url, timeout=10)
+            logger.info(f"[KeepAlive] Self-ping OK ({r.status_code})")
+        except Exception as e:
+            logger.warning(f"[KeepAlive] Self-ping failed: {e}")
+
 def start_http_server():
     port = int(os.environ.get('PORT', 8080))
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
@@ -677,6 +690,10 @@ if __name__ == "__main__":
     # Start trading loop in background thread
     trading_thread = Thread(target=trading_loop, daemon=True)
     trading_thread.start()
+
+    # Start keep-alive thread (prevents Render free plan from sleeping)
+    alive_thread = Thread(target=keep_alive, daemon=True)
+    alive_thread.start()
 
     # Run HTTP server in main thread
     start_http_server()
