@@ -17,4 +17,6 @@ LightGBM Classifier trading bot for DOGE/USDT perpetual swap on Huobi.
 - Sharpe ratio: 1.8+
 
 ## Deployment
-Render background worker. Set HTX_API_KEY and HTX_API_SECRET as environment variables.
+Render web service. Set HTX_API_KEY and HTX_API_SECRET as environment variables.
+
+访问根路径可打开控制面板，支持登录验证、策略启停、当前持仓、历史收益、交易明细、以及在线修改 Huobi API Key。

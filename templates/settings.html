@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <title>QuantBot 设置</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f3f4f6; color: #111827; margin: 0; }
+    .container { max-width: 900px; margin: 40px auto; padding: 24px; }
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 28px; }
+    .nav a { margin-left: 16px; color: #2563eb; text-decoration: none; font-weight: 600; }
+    .card { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); margin-bottom: 20px; }
+    label { display: block; margin-top: 16px; font-weight: 600; }
+    input { width: 100%; padding: 10px 12px; margin-top: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
+    button { margin-top: 20px; padding: 12px 18px; background: #2563eb; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+    .small-note { color: #6b7280; font-size: 14px; }
+    .success { padding: 12px; background: #ecfdf5; border-radius: 8px; color: #166534; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>QuantBot 设置</h1>
+        <p class="small-note">修改 Huobi API Key 和登录密码</p>
+      </div>
+      <div class="nav">
+        <a href="{{ url_for('dashboard') }}">仪表板</a>
+        <a href="{{ url_for('logout') }}">退出</a>
+      </div>
+    </header>
+
+    {% if message %}
+      <div class="success">{{ message }}</div>
+    {% endif %}
+
+    <section class="card">
+      <h2>Huobi API Key</h2>
+      <form method="post">
+        <label for="api_key">API Key</label>
+        <input id="api_key" name="api_key" value="{{ config.api_key or '' }}">
+        <label for="api_secret">API Secret</label>
+        <input id="api_secret" name="api_secret" type="password" value="{{ config.api_secret or '' }}">
+        <label for="username">登录用户名</label>
+        <input id="username" name="username" value="{{ config.username or '' }}">
+        <label for="password">新密码（留空则不修改）</label>
+        <input id="password" name="password" type="password" autocomplete="new-password">
+        <button type="submit">保存设置</button>
+      </form>
+      <p class="small-note">保存后，页面将继续使用新的 API Key 与登录信息。</p>
+    </section>
+  </div>
+</body>
+</html>

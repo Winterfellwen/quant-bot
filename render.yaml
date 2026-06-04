@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: doge-quantbot-v5
     env: python
     region: oregon
@@ -12,3 +12,5 @@ services:
         sync: false
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PORT
+        value: "8080"

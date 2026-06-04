@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <title>QuantBot 登录</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f5f7fb; color: #333; }
+    .container { max-width: 420px; margin: 80px auto; background: #fff; border-radius: 8px; box-shadow: 0 12px 28px rgba(0,0,0,.08); padding: 32px; }
+    h1 { margin-bottom: 24px; font-size: 24px; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; }
+    input { width: 100%; padding: 10px 12px; margin-bottom: 18px; border: 1px solid #cbd5e1; border-radius: 6px; }
+    button { width: 100%; padding: 12px; border: none; border-radius: 6px; background: #2563eb; color: #fff; font-size: 16px; cursor: pointer; }
+    .error { padding: 12px; margin-bottom: 18px; border-radius: 6px; background: #fee2e2; color: #991b1b; }
+    .footer { margin-top: 18px; font-size: 13px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>QuantBot 登录</h1>
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
+    <form method="post">
+      <label for="username">用户名</label>
+      <input id="username" name="username" value="{{ request.form.username or '' }}" required autofocus>
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password" required>
+      <button type="submit">登录</button>
+    </form>
+    <div class="footer">默认用户：admin，默认密码：admin。请登录后立即修改密码。</div>
+  </div>
+</body>
+</html>

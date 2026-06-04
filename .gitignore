@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 test_*.py
 test_*.txt
+bot_config.json
+bot_history.json
+session=test

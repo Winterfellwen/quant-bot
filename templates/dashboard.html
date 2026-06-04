@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-cn">
+<head>
+  <meta charset="utf-8">
+  <title>QuantBot 控制面板</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f3f4f6; color: #111827; margin: 0; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 28px; }
+    .nav a { margin-left: 16px; color: #2563eb; text-decoration: none; font-weight: 600; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); padding: 20px; margin-bottom: 20px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+    th { font-weight: 700; background: #f9fafb; }
+    .status { display: inline-block; padding: 6px 12px; border-radius: 999px; font-weight: 700; }
+    .status-running { background: #d1fae5; color: #065f46; }
+    .status-stopped { background: #fee2e2; color: #991b1b; }
+    .status-error { background: #fee2e2; color: #991b1b; }
+    .button-group { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+    .button-group button,
+    .button-group form button { background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; }
+    .summary { line-height: 1.75; white-space: pre-wrap; }
+    .small-note { color: #6b7280; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>QuantBot 控制面板</h1>
+        <p class="small-note">当前登录用户：{{ username }}</p>
+      </div>
+      <div class="nav">
+        <a href="{{ url_for('dashboard') }}">仪表板</a>
+        <a href="{{ url_for('settings') }}">设置</a>
+        <a href="{{ url_for('logout') }}">退出</a>
+      </div>
+    </header>
+    <div class="button-group">
+      <button type="button" onclick="refreshData()">刷新</button>
+      <span class="small-note">页面将每 5 秒自动刷新数据。</span>
+    </div>
+
+    <section class="card">
+      <h2>策略概览</h2>
+      <div class="summary">{{ strategy }}</div>
+    </section>
+
+    <section class="card">
+      <h2>运行状态</h2>
+      <table>
+        <tr><th>字段</th><th>值</th></tr>
+        <tr><td>状态</td><td><span id="status_status" class="status status-{{ state.status }}">{{ state.status }}</span></td></tr>
+        <tr><td>最近检查</td><td id="status_last_check">{{ state.last_check or '暂无' }}</td></tr>
+        <tr><td>当前持仓</td><td id="status_current_position">{{ state.current_position or '无' }}</td></tr>
+        <tr><td>持仓手数</td><td id="status_current_contracts">{{ state.current_contracts or 0 }}</td></tr>
+        <tr><td>最新概率</td><td id="status_last_prob">{{ state.last_prob or 0 }}</td></tr>
+        <tr><td>当前杠杆</td><td id="status_leverage">{{ state.leverage or 0 }}x</td></tr>
+        <tr><td>可用 USDT</td><td id="status_available_usdt">{{ state.available_usdt or 0 }}</td></tr>
+        <tr><td>总资产</td><td id="status_total_usdt">{{ state.total_usdt or 0 }}</td></tr>
+        <tr><td>估算权益</td><td id="status_equity">{{ state.equity or 0 }}</td></tr>
+        <tr><td>总权益</td><td id="status_equity">{{ state.equity or 0 }}x</td></tr>
+        <tr><td>已实现收益</td><td id="status_cumulative_return">{{ state.cumulative_return or 0 }}x</td></tr>
+        <tr><td>回撤</td><td id="status_drawdown_pct">{{ state.drawdown_pct or 0 }}%</td></tr>
+      </table>
+      <div class="button-group">
+        <button type="button" onclick="refreshData()">刷新</button>
+        <form action="{{ url_for('start') }}" method="post"><button type="submit">启动策略</button></form>
+        <form action="{{ url_for('stop') }}" method="post"><button type="submit">停止策略</button></form>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>当前持仓</h2>
+      <table>
+        <tr><th>字段</th><th>值</th></tr>
+        <tr><td>当前方向</td><td id="position_current_position">{{ state.current_position or '无' }}</td></tr>
+        <tr><td>持仓手数</td><td id="position_current_contracts">{{ state.current_contracts or 0 }}</td></tr>
+        <tr><td>最后成交概率</td><td id="position_last_prob">{{ state.last_prob or 0 }}</td></tr>
+        <tr><td>资金使用</td><td id="position_balance">{{ state.available_usdt or 0 }} 可用 / {{ state.total_usdt or 0 }} 总计</td></tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>历史收益</h2>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>总权益</th><th>已实现收益</th><th>回撤</th></tr>
+        </thead>
+        <tbody id="performance_body">
+        {% for entry in performance %}
+          <tr>
+            <td>{{ entry.time }}</td>
+            <td>{{ "{:.4f}".format(entry.equity) }}x</td>
+            <td>{{ "{:.4f}".format(entry.cumulative_return) }}x</td>
+            <td>{{ "{:.2f}".format(entry.drawdown_pct) }}%</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4">暂无历史收益数据</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>交易明细</h2>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>事件</th><th>详情</th></tr>
+        </thead>
+        <tbody id="trades_body">
+        {% for item in trades %}
+          <tr>
+            <td>{{ item.time }}</td>
+            <td>{{ item.event }}</td>
+            <td>{{ item.details }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3">暂无交易记录</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+  <script>
+    function formatNumber(value, decimals) {
+      return Number(value).toFixed(decimals);
+    }
+
+    function updateStatus(data) {
+      const statusSpan = document.getElementById('status_status');
+      statusSpan.textContent = data.status || 'unknown';
+      statusSpan.className = 'status status-' + (data.status || 'unknown');
+      document.getElementById('status_last_check').textContent = data.last_check || '暂无';
+      document.getElementById('status_current_position').textContent = data.current_position || '无';
+      document.getElementById('status_current_contracts').textContent = data.current_contracts || 0;
+      document.getElementById('status_last_prob').textContent = data.last_prob?.toFixed(4) || 0;
+      document.getElementById('status_leverage').textContent = (data.leverage || 0) + 'x';
+      document.getElementById('status_available_usdt').textContent = formatNumber(data.available_usdt || 0, 2);
+      document.getElementById('status_total_usdt').textContent = formatNumber(data.total_usdt || 0, 2);
+      document.getElementById('status_equity').textContent = formatNumber(data.equity || 0, 2);
+      document.getElementById('status_equity').textContent = formatNumber(data.equity || 0, 4) + 'x';
+      document.getElementById('status_cumulative_return').textContent = formatNumber(data.cumulative_return || 0, 4) + 'x';
+      document.getElementById('status_drawdown_pct').textContent = formatNumber(data.drawdown_pct || 0, 2) + '%';
+      document.getElementById('position_current_position').textContent = data.current_position || '无';
+      document.getElementById('position_current_contracts').textContent = data.current_contracts || 0;
+      document.getElementById('position_last_prob').textContent = data.last_prob?.toFixed(4) || 0;
+      document.getElementById('position_balance').textContent = formatNumber(data.available_usdt || 0, 2) + ' 可用 / ' + formatNumber(data.total_usdt || 0, 2) + ' 总计';
+    }
+
+    function renderPerformance(performance) {
+      const body = document.getElementById('performance_body');
+      body.innerHTML = '';
+      if (!performance || performance.length === 0) {
+        body.innerHTML = '<tr><td colspan="4">暂无历史收益数据</td></tr>';
+        return;
+      }
+      performance.slice(0, 20).forEach(entry => {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${entry.time}</td><td>${Number(entry.equity).toFixed(4)}x</td><td>${Number(entry.cumulative_return).toFixed(4)}x</td><td>${Number(entry.drawdown_pct).toFixed(2)}%</td>`;
+        body.appendChild(row);
+      });
+    }
+
+    function renderTrades(trades) {
+      const body = document.getElementById('trades_body');
+      body.innerHTML = '';
+      if (!trades || trades.length === 0) {
+        body.innerHTML = '<tr><td colspan="3">暂无交易记录</td></tr>';
+        return;
+      }
+      trades.slice(0, 20).forEach(item => {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${item.time}</td><td>${item.event}</td><td>${item.details}</td>`;
+        body.appendChild(row);
+      });
+    }
+
+    function refreshData() {
+      fetch('/api/status')
+        .then(resp => resp.json())
+        .then(updateStatus)
+        .catch(console.error);
+      fetch('/api/history')
+        .then(resp => resp.json())
+        .then(data => {
+          renderPerformance(data.performance);
+          renderTrades(data.trades);
+        })
+        .catch(console.error);
+    }
+
+    window.addEventListener('load', function() {
+      refreshData();
+      setInterval(refreshData, 5000);
+    });
+  </script>
+</body>
+</html>
